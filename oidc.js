@@ -5,16 +5,17 @@
  */
 
 // Constants for common error message. These will be cleaned up.
-var ERR_CFG_VARS              = 'OIDC missing configuration variables: ';
-var ERR_AC_TOKEN              = 'OIDC Access Token validation error: ';
-var ERR_ID_TOKEN              = 'OIDC ID Token validation error: ';
-var ERR_IDP_AUTH              = 'OIDC unexpected response from IdP in code exchange';
-var ERR_TOKEN_RES             = 'OIDC AuthZ code sent but token response is not JSON. ';
-var ERR_X_CLIENT_ID_COOKIE    = 'X-Client-Id should be in cookie';
-var ERR_X_CLIENT_ID_NOT_FOUND = 'X-Client-Id not found in the IdP app';
-var WRN_SESSION               = 'OIDC session is invalid';
-var INF_REFRESH_TOKEN         = 'OIDC refresh success, updating id_token for ';
-var INF_REPLACE_TOKEN         = 'OIDC replacing previous refresh token (';
+var ERR_CFG_VARS      = 'OIDC missing configuration variables';
+var ERR_AC_TOKEN      = 'OIDC Access Token validation error';
+var ERR_ID_TOKEN      = 'OIDC ID Token validation error';
+var ERR_IDP_AUTH      = 'OIDC unexpected response from IdP in code exchange';
+var ERR_TOKEN_RES     = 'OIDC AuthZ code sent but token response is not JSON';
+var ERR_CLIENT_ID     = 'Check if cookie is removed, and client_id is there';
+var ERR_IDP_APP_NAME  = 'IdP app is not set in $oidc_app_name';
+var WRN_SESSION       = 'OIDC session is invalid';
+var INF_SESSION       = 'OIDC session is valid';
+var INF_REFRESH_TOKEN = 'OIDC refresh success, updating tokens for ';
+var INF_REPLACE_TOKEN = 'OIDC replacing previous refresh token';
 
 // Flag to check if there is still valid session cookie. It is used by auth()
 // and validateIdToken().
@@ -31,9 +32,7 @@ export default {
     logout,
     redirectPostLogin,
     redirectPostLogout,
-    testAccessTokenPayload,
-    testExtractToken,
-    testIdTokenPayload,
+    tokenEncoder,
     validateIdToken,
     validateAccessToken,
     validateSession
@@ -135,10 +134,24 @@ function validateIdToken(r) {
 //
 // - https://openid.net/specs/openid-connect-core-1_0.html#CodeFlowTokenValidation
 // - https://openid.net/specs/openid-connect-core-1_0.html#ImplicitTokenValidation
+//
 // - This function is called by the location of `_access_token_validation` which
 //   is called by either OIDC code exchange or refersh token request.
+//
 // - The 'aud' claim isn't contained in general ID token from Amazon Cognito,
 //   although we can add it. Hence, the claim isn't part of this validation.
+//
+// - This function is for the case when you want to validate the token within
+//   NGINX layer to following the spec. of OpenID Connect Core 1.0. 
+//
+// - But, this token is mostly validated by using one of following options.
+//
+//   + Option 1. validate a token (assumtion: JWT format) by using
+//               a NGINX auth_jwt directive to validate it via IdP URI.
+//     auth_jwt "" token=$access_token;
+//     auth_jwt_key_request /_jwks_uri;
+//
+//   + Option 2. validate a token by using IdP token introspection endpoint.
 //
 function validateAccessToken(r) {
     var missingClaims = []
@@ -179,7 +192,8 @@ function logout(r) {
     // Call the IDP logout endpoint with custom query parameters
     // if the IDP doesn't support RP-initiated logout.
     } else {
-        queryParams = generateQueryParams(r.variables.oidc_logout_query_params);
+        queryParams = '?' + generateQueryParams(
+            r.variables.oidc_logout_query_params);
     }
     r.variables.session_id    = '-';
     r.variables.id_token      = '-';
@@ -272,7 +286,7 @@ function startIdPAuthZ(r) {
         }
     }
     if (missingConfig.length) {
-        r.error(ERR_CFG_VARS + '$oidc_' + missingConfig.join(' $oidc_'));
+        r.error(ERR_CFG_VARS + ': $oidc_' + missingConfig.join(' $oidc_'));
         r.return(500, r.variables.internal_error_message);
         return;
     }
@@ -336,7 +350,7 @@ function handleSuccessfulRefreshResponse(r, res) {
         // Update new refresh token to key/value store if we got a new one.
         r.log(INF_REFRESH_TOKEN + r.variables.cookie_session_id);
         if (r.variables.refresh_token != tokenset.refresh_token) {
-            r.log(INF_REPLACE_TOKEN + r.variables.refresh_token + 
+            r.log(INF_REPLACE_TOKEN + ' (' + r.variables.refresh_token + 
                     ') with new value: ' + tokenset.refresh_token);
             r.variables.refresh_token = tokenset.refresh_token;
         }
@@ -380,7 +394,7 @@ function refershToken(r) {
 function setTokenParams(r) {
     clearTokenParams(r)
     if (r.variables.oidc_token_query_params_enable == 1) {
-        r.variables.token_query_params = generateQueryParams(
+        r.variables.token_query_params = '?' + generateQueryParams(
             r.variables.oidc_token_query_params
         );
     }
@@ -389,6 +403,14 @@ function setTokenParams(r) {
         r.variables.oidc_token_path_params_enable,
         r.variables.oidc_token_path_params
     );
+}
+
+// Generate and return token encoder based on token header params.
+function tokenEncoder(r) {
+    if (r.variables.oidc_token_header_params_enable == 1) {
+        return generateCustomHeaders(r, r.variables.oidc_token_header_params)
+    }
+    return "";
 }
 
 // Clear query parameters of the temporary stroage for the NGINX if OIDC's token
@@ -466,7 +488,7 @@ function handleSuccessfulTokenResponse(r, res) {
                                      '; ' + r.variables.oidc_cookie_flags;
         r.return(302, r.variables.redirect_base + r.variables.cookie_auth_redir);
     } catch (e) {
-        r.error(ERR_TOKEN_RES + res.responseBody);
+        r.error(ERR_TOKEN_RES + ' ' + res.responseBody);
         r.return(502);
     }
 }
@@ -503,7 +525,7 @@ function getAuthZArgs(r) {
     var redirectURI = r.variables.redirect_base + r.variables.redir_location;
     var authZArgs   = '?response_type=code&scope=' + r.variables.oidc_scopes +
                       '&client_id='                + r.variables.oidc_client + 
-                      '&redirect_uri='             + redirectURI; + 
+                      '&redirect_uri='             + redirectURI + 
                       '&nonce='                    + nonceHash;
     var cookieFlags = r.variables.oidc_cookie_flags;
     r.headersOut['Set-Cookie'] = [
@@ -529,7 +551,8 @@ function getAuthZArgs(r) {
     }
 
     if (r.variables.oidc_authz_query_params_enable == 1) {
-        return generateQueryParams(r.variables.oidc_authz_query_params);
+        return authZArgs += '&' + generateQueryParams(
+            r.variables.oidc_authz_query_params);
     }
     return authZArgs;
 }
@@ -537,11 +560,21 @@ function getAuthZArgs(r) {
 // Generate custom query parameters from JSON object
 function generateQueryParams(obj) {
     var items = JSON.parse(obj);
-    var args = '?'
+    var args = ''
     for (var key in items) {
         args += key + '=' + items[key] + '&'
     }
     return args.slice(0, -1)
+}
+
+// Generate custom headers from JSON object
+function generateCustomHeaders(r, obj) {
+    var items = JSON.parse(obj);
+    for (var key in items) {
+        if (key == 'Accept-Encoding') {
+            return items[key]
+        }
+    }
 }
 
 // Generate and return random string.
@@ -685,7 +718,7 @@ function isValidRequiredClaims(r, msgPrefix, missingClaims) {
             }
         }
         if (missingClaims.length) {
-            r.error(msgPrefix + 'missing claim(s) ' + missingClaims.join(' '));
+            r.error(msgPrefix + ': missing claim(s) ' + missingClaims.join(' '));
             return false;
         }
     } catch (e) {
@@ -714,7 +747,10 @@ function isValidTokenSet(r, tokenset) {
         // The validateIdToken() logs error so that r.error() isn't used.
         return isErr;
     }
-    if (!isValidToken(r, '/_access_token_validation', tokenset.access_token)) {
+    // The access token is mostly validated by IdP using auth_jwt directive.
+    // This can be used when you want to validate the token set in NGINX.
+    if (r.variables.access_token_validation_enable == 1 &&
+        !isValidToken(r, '/_access_token_validation', tokenset.access_token)) {
         // The validateAccessToken() logs error so that r.error() isn't used.
         return isErr;
     }
@@ -770,7 +806,7 @@ function generateSession(r) {
 // Check if session cookie is valid, and generate new session id otherwise.
 function isValidSession(r) {
     if (r.variables.session_validation_enable == 0) {
-        return false;
+        return true;
     }
     r.log('Start checking if there is an existing valid session...')
     var valid_session_id = generateSession(r);
@@ -784,12 +820,12 @@ function isValidSession(r) {
 // the session cookie could play from any client (browsers or command line).
 //
 function validateSession(r) {
-    if (r.variables.session_validation_enable == 1 && !isValidSession(r)) {
+    if (!isValidSession(r)) {
         r.warn(WRN_SESSION)
-        r.return(401, '{"message": "' + WRN_SESSION + '"}\n')
+        r.return(403, '{"message": "' + WRN_SESSION + '"}\n')
         return false;
     }
-    r.return(200, '{"message": "' + WRN_SESSION + '"}\n') 
+    r.return(200, '{"message": "' + INF_SESSION + '"}\n') 
     return true;
 }
 
@@ -800,75 +836,15 @@ function validateSession(r) {
 function isValidXClientId(r) {
     if (r.variables.client_id_validation_enable == 1) {
         if (!r.variables.cookie_client_id) {
-            r.warn(ERR_X_CLIENT_ID_COOKIE)
-            r.return(400, '{"message": "' + ERR_X_CLIENT_ID_COOKIE + '"}\n')
+            r.warn(ERR_CLIENT_ID)
+            r.return(400, '{"message": "' + ERR_CLIENT_ID + '"}\n')
             return false
         }
         if (r.variables.oidc_app_name == '') {
-            var errMsg = ERR_X_CLIENT_ID_NOT_FOUND + ': ' + r.variables.cookie_client_id;
-            r.warn(errMsg)
-            r.return(404, '{"message": "' + errMsg + '"}\n')
+            r.warn(ERR_IDP_APP_NAME)
+            r.return(404, '{"message": "' + ERR_IDP_APP_NAME + '"}\n')
             return false
         }
     }
     return true
-}
-
-// Return JWT header and payload
-function jwt(r, token) {
-    var parts = token.split('.').slice(0,2)
-        .map(v=>Buffer.from(v, 'base64url').toString())
-        .map(JSON.parse);
-    return { 
-        headers: parts[0], 
-        payload: parts[1] 
-    };
-}
-
-
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- *                                                                             *
- *                      3. Common Functions for Testing                        *
- *                                                                             *
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-
-// Test for extracting bearer token from the header of API request.
-function testExtractToken (r) {
-    var msg = `{
-        "message": "This is to show which token is part of proxy header(s) in a server app.",
-        "uri":"` + r.variables.request_uri + `"`;
-    var res = extractToken(r, 'Authorization', true, '/_access_token_validation', msg)
-    if (!res[0]) {
-        return 
-    }
-    msg = res[1]
-
-    var res = extractToken(r, 'x-id-token', false, '/_id_token_validation', msg)
-    if (!res[0]) {
-        return 
-    }
-    msg = res[1]
-
-    var body = msg + '}\n';
-    r.return(200, body);
-}
-
-// Test for extracting sub, subgroups (custom claim) from token
-function testTokenBodyWithCustomClaim(r, token) {
-    var res = jwt(r, token)
-    var msgToken = `"token": "` + token + `"`
-    var msgSub = `"sub": "` + res.payload.sub + `"`
-    var msgSubGroups = `"subgroups": "` + res.payload.subgroups + `"`
-    var body = `{` + msgToken + `,` + msgSub + `,` + msgSubGroups + `}`
-    return body
-}
-
-// Return access token details with custom claim for testing
-function testAccessTokenPayload(r) {
-    r.return(200, testTokenBodyWithCustomClaim(r, r.variables.access_token))
-}
-
-// Return ID token details with custom claim for testing
-function testIdTokenPayload(r) {
-    r.return(200, testTokenBodyWithCustomClaim(r, r.variables.id_token))
 }
